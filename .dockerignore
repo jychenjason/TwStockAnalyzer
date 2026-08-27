@@ -1,0 +1,14 @@
+.git
+__pycache__
+*.pyc
+.omo/
+.scratch/
+tests/
+.env
+*.db
+*.log
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.claude/

@@ -1,0 +1,46 @@
+# Environment
+.env
+.bash_history
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.vscode-server/
+.idea/
+.claude/settings.local.json
+*.swp
+*.swo
+
+# Data
+data/
+
+# OMo
+.omo/evidence/
+.omo/run-continuation/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Pytest
+.pytest_cache/
+
+# Containers
+.cache/
+.devcontainer/
+.dotnet/

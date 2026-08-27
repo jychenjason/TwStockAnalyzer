@@ -1,0 +1,34 @@
+services:
+  # One-shot CLI runs: `docker compose run --rm cli <command>`.
+  # Profiled so a bare `docker compose up` does not start it — it would only
+  # print --help and exit.  `run` targets it explicitly, so the profile is no
+  # obstacle.
+  cli:
+    build: .
+    image: twstock-analyzer:latest
+    profiles: ["cli"]
+    # Runs as root; docker-entrypoint.sh chowns /app/data and drops to appuser.
+    env_file: .env
+    volumes:
+      - ./:/app
+    command: ["--help"]
+
+  api:
+    build: .
+    image: twstock-analyzer:latest
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+    command: ["serve", "--port", "8000"]
+
+  streamlit:
+    build: .
+    image: twstock-analyzer:latest
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8501:8501"
+    command: ["streamlit"]
