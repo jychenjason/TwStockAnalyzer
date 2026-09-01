@@ -332,6 +332,53 @@ def create_app() -> FastAPI:
         }
 
     # ------------------------------------------------------------------
+    # POST /stocks/update-existing
+    # ------------------------------------------------------------------
+    @app.post("/stocks/update-existing")
+    def update_existing_stocks(
+        data_type: str = "daily",
+        force: bool = False,
+        start: Optional[str] = None,
+    ):
+        """Update every stock already present in the local database."""
+        import subprocess
+        import sys
+
+        command = [
+            sys.executable, "-m", "twstock_analyzer.cli.main",
+            "update", "existing", "--type", data_type,
+        ]
+        if force:
+            command.append("--force")
+        if start:
+            command.extend(["--start", start])
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(status_code=504, detail="Update existing timed out after 1800 seconds") from exc
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Update existing failed: {result.stderr}",
+            )
+
+        return {
+            "scope": "existing",
+            "data_type": data_type,
+            "force": force,
+            "start": start,
+            "status": "success",
+            "output": result.stdout,
+        }
+
+    # ------------------------------------------------------------------
     # POST /stocks/{stock_id}/report
     # ------------------------------------------------------------------
     @app.post("/stocks/{stock_id}/report")
@@ -423,6 +470,7 @@ def create_app() -> FastAPI:
         eps_growth_min: Optional[float] = None,
         revenue_yoy_min: Optional[float] = None,
         dividend_yield_min: Optional[float] = None,
+        name: Optional[str] = None,
     ):
         import os
 
@@ -464,46 +512,264 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+        criteria_data = {
+            "pe_min": pe_min,
+            "pe_max": pe_max,
+            "rsi_min": rsi_min,
+            "rsi_max": rsi_max,
+            "volume_min": volume_min,
+            "volume_spike": volume_spike,
+            "volume_spike_window": volume_spike_window,
+            "spike_direction": spike_direction,
+            "spike_direction_band": spike_direction_band,
+            "ma_crossover": ma_crossover,
+            "ma_crossover_direction": ma_direction,
+            "ma_crossover_within": ma_within,
+            "ma_trend_align": ma_trend_align,
+            "ma_trend_window": ma_trend_window,
+            "eps_min": eps_min,
+            "eps_growth_min": eps_growth_min,
+            "revenue_yoy_min": revenue_yoy_min,
+            "dividend_yield_min": dividend_yield_min,
+        }
+
+        if name:
+            import json
+            import sqlite3
+
+            try:
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    "INSERT OR REPLACE INTO screening_criteria "
+                    "(name, criteria_json, updated_at) VALUES (?, ?, datetime('now'))",
+                    (name, json.dumps(criteria_data)),
+                )
+                conn.commit()
+                conn.close()
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Could not save screen: {exc}") from exc
+
         return {
-            "criteria": {
-                "pe_min": pe_min,
-                "pe_max": pe_max,
-                "rsi_min": rsi_min,
-                "rsi_max": rsi_max,
-                "volume_min": volume_min,
-                "volume_spike": volume_spike,
-                "volume_spike_window": volume_spike_window,
-                "spike_direction": spike_direction,
-                "ma_crossover": ma_crossover,
-                "ma_direction": ma_direction,
-                "ma_within": ma_within,
-                "ma_trend_align": ma_trend_align,
-                "ma_trend_window": ma_trend_window,
-            },
+            "criteria": criteria_data,
+            "saved_as": name,
             "matches": len(df),
             "results": _df_to_records(df),
         }
+
+    # ------------------------------------------------------------------
+    # Saved screens: list, load/run, and delete
+    # ------------------------------------------------------------------
+    @app.get("/screens")
+    def list_saved_screens():
+        import json
+        import os
+        import sqlite3
+
+        db_path = os.environ.get("TWSTOCK_DB", "data/twstock.db")
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, name, criteria_json, created_at, updated_at "
+                "FROM screening_criteria ORDER BY created_at DESC"
+            ).fetchall()
+            conn.close()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "criteria": json.loads(row["criteria_json"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    @app.get("/screens/{criteria_id}")
+    def run_saved_screen(criteria_id: int):
+        import json
+        import os
+        import sqlite3
+
+        from twstock_analyzer.screening.screener import MissingDataError, ScreenCriteria, run_screen as _run_screen
+
+        db_path = os.environ.get("TWSTOCK_DB", "data/twstock.db")
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT id, name, criteria_json, created_at, updated_at "
+                "FROM screening_criteria WHERE id = ?",
+                (criteria_id,),
+            ).fetchone()
+            conn.close()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Saved screen {criteria_id} not found")
+
+        criteria_data = json.loads(row["criteria_json"])
+        # Accept records written by older CLI releases.
+        if "ma_direction" in criteria_data:
+            criteria_data["ma_crossover_direction"] = criteria_data.pop("ma_direction")
+        if "ma_within" in criteria_data:
+            criteria_data["ma_crossover_within"] = criteria_data.pop("ma_within")
+
+        try:
+            df = _run_screen(ScreenCriteria(**criteria_data), db_path=db_path)
+        except MissingDataError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "criteria": criteria_data,
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "matches": len(df),
+            "results": _df_to_records(df),
+        }
+
+    @app.delete("/screens/{criteria_id}")
+    def delete_saved_screen(criteria_id: int):
+        import os
+        import sqlite3
+
+        db_path = os.environ.get("TWSTOCK_DB", "data/twstock.db")
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.execute("DELETE FROM screening_criteria WHERE id = ?", (criteria_id,))
+            conn.commit()
+            deleted = cursor.rowcount
+            conn.close()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Saved screen {criteria_id} not found")
+        return {"id": criteria_id, "status": "deleted"}
 
     # ------------------------------------------------------------------
     # POST /backtest
     # ------------------------------------------------------------------
     @app.post("/backtest")
     def run_backtest(
-        stocks: str = "2330",
+        stocks: Optional[str] = None,
         capital: float = 1000000.0,
         signal: str = "ma_cross",
         start_date: str = "2024-01-01",
         end_date: Optional[str] = None,
+        screen_id: Optional[int] = None,
+        pe_min: Optional[float] = None,
+        pe_max: Optional[float] = None,
+        rsi_min: Optional[float] = None,
+        rsi_max: Optional[float] = None,
+        volume_min: Optional[int] = None,
+        volume_spike: Optional[float] = None,
+        volume_spike_window: int = 20,
+        spike_direction: Optional[str] = None,
+        spike_direction_band: float = 1.0,
+        ma_crossover: Optional[str] = None,
+        ma_direction: str = "up",
+        ma_within: int = 1,
+        ma_trend_align: bool = True,
+        ma_trend_window: int = 3,
+        eps_min: Optional[float] = None,
+        eps_growth_min: Optional[float] = None,
+        revenue_yoy_min: Optional[float] = None,
+        dividend_yield_min: Optional[float] = None,
     ):
+        import json
         import os
+        import sqlite3
         from datetime import datetime
 
         from twstock_analyzer.backtesting.engine import run_backtest as _run_backtest
         from twstock_analyzer.backtesting.portfolio import PortfolioConfig
+        from twstock_analyzer.screening.screener import (
+            MissingDataError,
+            ScreenCriteria,
+            run_screen as _run_screen,
+        )
 
         db_path = os.environ.get("TWSTOCK_DB", "data/twstock.db")
 
-        stock_ids = [s.strip() for s in stocks.split(",") if s.strip()]
+        requested_stock_ids = [s.strip() for s in (stocks or "").split(",") if s.strip()]
+        screen_data = {
+            "pe_min": pe_min,
+            "pe_max": pe_max,
+            "rsi_min": rsi_min,
+            "rsi_max": rsi_max,
+            "volume_min": volume_min,
+            "volume_spike": volume_spike,
+            "volume_spike_window": volume_spike_window,
+            "spike_direction": spike_direction,
+            "spike_direction_band": spike_direction_band,
+            "ma_crossover": ma_crossover,
+            "ma_crossover_direction": ma_direction,
+            "ma_crossover_within": ma_within,
+            "ma_trend_align": ma_trend_align,
+            "ma_trend_window": ma_trend_window,
+            "eps_min": eps_min,
+            "eps_growth_min": eps_growth_min,
+            "revenue_yoy_min": revenue_yoy_min,
+            "dividend_yield_min": dividend_yield_min,
+        }
+        active_filter_names = {
+            "pe_min", "pe_max", "rsi_min", "rsi_max", "volume_min",
+            "volume_spike", "spike_direction", "ma_crossover", "eps_min",
+            "eps_growth_min", "revenue_yoy_min", "dividend_yield_min",
+        }
+        screening_requested = screen_id is not None or any(
+            screen_data[name] is not None for name in active_filter_names
+        )
+
+        if screen_id is not None:
+            try:
+                conn = sqlite3.connect(db_path)
+                row = conn.execute(
+                    "SELECT criteria_json FROM screening_criteria WHERE id = ?", (screen_id,)
+                ).fetchone()
+                conn.close()
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"Saved screen {screen_id} not found")
+            saved_data = json.loads(row[0])
+            if "ma_direction" in saved_data:
+                saved_data["ma_crossover_direction"] = saved_data.pop("ma_direction")
+            if "ma_within" in saved_data:
+                saved_data["ma_crossover_within"] = saved_data.pop("ma_within")
+            # Explicit request parameters override a saved screen only when they
+            # differ from their API defaults or activate a filter.
+            for key in active_filter_names:
+                if screen_data[key] is not None:
+                    saved_data[key] = screen_data[key]
+            screen_data = saved_data
+
+        if screening_requested:
+            try:
+                screened = _run_screen(
+                    ScreenCriteria(**screen_data),
+                    stock_ids=requested_stock_ids or None,
+                    db_path=db_path,
+                )
+            except MissingDataError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            stock_ids = screened["stock_id"].astype(str).tolist() if not screened.empty else []
+            if not stock_ids:
+                raise HTTPException(status_code=404, detail="No stocks matched the backtest screen")
+        else:
+            stock_ids = requested_stock_ids or ["2330"]
+
         end = end_date or datetime.now().strftime("%Y-%m-%d")
         config = PortfolioConfig(initial_capital=capital)
 
@@ -525,10 +791,22 @@ def create_app() -> FastAPI:
 
         return {
             "stocks": stock_ids,
+            "requested_stocks": requested_stock_ids,
             "signal": signal,
             "start_date": start_date,
             "end_date": end,
             "initial_capital": capital,
+            "screen": {
+                "applied": screening_requested,
+                "saved_screen_id": screen_id,
+                "mode": "current_snapshot" if screening_requested else None,
+                "criteria": screen_data if screening_requested else None,
+                "warning": (
+                    "The universe was selected from the current database snapshot. "
+                    "Using it for a historical period may introduce look-ahead/survivorship bias."
+                    if screening_requested else None
+                ),
+            },
             "metrics": {
                 "total_return": float(m.total_return),
                 "cagr": float(m.cagr),

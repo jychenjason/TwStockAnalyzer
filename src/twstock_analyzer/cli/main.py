@@ -336,24 +336,104 @@ backtest_app = typer.Typer(help="Run and manage portfolio backtests")
 
 @backtest_app.command(name="run")
 def backtest_run(
-    stocks: str = typer.Option(..., "--stocks", "-s", help="Comma-separated stock IDs"),
+    stocks: Optional[str] = typer.Option(None, "--stocks", "-s", help="Comma-separated candidate stock IDs; omit to screen all cached stocks"),
     capital: float = typer.Option(1000000.0, "--capital", "-c", help="Initial capital"),
     signal: str = typer.Option("ma_cross", "--signal", help="Signal method: ma_cross, rsi, macd"),
     start: str = typer.Option("2024-01-01", "--start", help="Start date YYYY-MM-DD"),
     end: str = typer.Option("", "--end", help="End date YYYY-MM-DD"),
     save: bool = typer.Option(False, "--save", help="Save result to DB"),
+    screen_id: Optional[int] = typer.Option(None, "--screen-id", help="Use a saved screen as the universe filter"),
+    pe_min: Optional[float] = typer.Option(None, "--pe-min"),
+    pe_max: Optional[float] = typer.Option(None, "--pe-max"),
+    rsi_min: Optional[float] = typer.Option(None, "--rsi-min"),
+    rsi_max: Optional[float] = typer.Option(None, "--rsi-max"),
+    volume_min: Optional[int] = typer.Option(None, "--volume-min"),
+    volume_spike: Optional[float] = typer.Option(None, "--volume-spike"),
+    volume_spike_window: int = typer.Option(VOLUME_SPIKE_WINDOW, "--volume-spike-window"),
+    spike_direction: Optional[str] = typer.Option(None, "--spike-direction"),
+    spike_direction_band: float = typer.Option(SPIKE_DIRECTION_BAND, "--spike-direction-band"),
+    ma_crossover: Optional[str] = typer.Option(None, "--ma-cross"),
+    ma_direction: str = typer.Option("up", "--ma-direction"),
+    ma_within: int = typer.Option(1, "--ma-within"),
+    ma_trend_align: bool = typer.Option(True, "--ma-trend-align/--no-ma-trend-align"),
+    ma_trend_window: int = typer.Option(MA_TREND_WINDOW, "--ma-trend-window"),
+    eps_min: Optional[float] = typer.Option(None, "--eps-min"),
+    eps_growth_min: Optional[float] = typer.Option(None, "--eps-growth-min"),
+    revenue_yoy_min: Optional[float] = typer.Option(None, "--revenue-yoy-min"),
+    dividend_yield_min: Optional[float] = typer.Option(None, "--dividend-yield-min"),
 ):
     """Run a portfolio backtest simulation."""
     logger = get_logger("cli.backtest.run", debug=True)
     _log_action(logger, f"stocks={stocks}, signal={signal}", "START")
 
-    stock_ids = [s.strip() for s in stocks.split(",") if s.strip()]
-    for sid in stock_ids:
+    requested_stock_ids = [s.strip() for s in (stocks or "").split(",") if s.strip()]
+    for sid in requested_stock_ids:
         try:
             validate_stock_id(sid)
         except ValueError as exc:
             _clog(logger, f"Invalid stock ID '{sid}': {exc}", "INVALID", rich_message=f"[red]Invalid stock ID '{sid}': {exc}[/red]")
             raise typer.Exit(code=1)
+
+    criteria_data = {
+        "pe_min": pe_min, "pe_max": pe_max,
+        "rsi_min": rsi_min, "rsi_max": rsi_max,
+        "volume_min": volume_min,
+        "volume_spike": volume_spike, "volume_spike_window": volume_spike_window,
+        "spike_direction": spike_direction, "spike_direction_band": spike_direction_band,
+        "ma_crossover": ma_crossover, "ma_crossover_direction": ma_direction,
+        "ma_crossover_within": ma_within, "ma_trend_align": ma_trend_align,
+        "ma_trend_window": ma_trend_window,
+        "eps_min": eps_min, "eps_growth_min": eps_growth_min,
+        "revenue_yoy_min": revenue_yoy_min,
+        "dividend_yield_min": dividend_yield_min,
+    }
+    active_names = {
+        "pe_min", "pe_max", "rsi_min", "rsi_max", "volume_min", "volume_spike",
+        "spike_direction", "ma_crossover", "eps_min", "eps_growth_min",
+        "revenue_yoy_min", "dividend_yield_min",
+    }
+    screening_requested = screen_id is not None or any(criteria_data[key] is not None for key in active_names)
+
+    if screen_id is not None:
+        import sqlite3
+        conn = sqlite3.connect(DEFAULT_DB)
+        try:
+            row = conn.execute(
+                "SELECT criteria_json FROM screening_criteria WHERE id = ?", (screen_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            _clog(logger, f"Saved screen #{screen_id} not found", "NOT_FOUND", rich_message=f"[red]Saved screen #{screen_id} not found[/red]")
+            raise typer.Exit(code=1)
+        criteria_data = json.loads(row[0])
+        if "ma_direction" in criteria_data:
+            criteria_data["ma_crossover_direction"] = criteria_data.pop("ma_direction")
+        if "ma_within" in criteria_data:
+            criteria_data["ma_crossover_within"] = criteria_data.pop("ma_within")
+
+    if screening_requested:
+        try:
+            screened = run_screen(
+                ScreenCriteria(**criteria_data),
+                stock_ids=requested_stock_ids or None,
+                db_path=DEFAULT_DB,
+            )
+        except (MissingDataError, TypeError, ValueError) as exc:
+            _clog(logger, str(exc), "SCREEN_FAILED", rich_message=f"[red]{exc}[/red]")
+            raise typer.Exit(code=1)
+        stock_ids = screened["stock_id"].astype(str).tolist() if not screened.empty else []
+        if not stock_ids:
+            _clog(logger, "No stocks matched the backtest screen.", "NO_MATCH", rich_message="[yellow]No stocks matched the backtest screen.[/yellow]")
+            return
+        _clog(
+            logger,
+            "Backtest universe uses the current database snapshot; historical results may contain look-ahead/survivorship bias.",
+            "BIAS_WARNING",
+            rich_message="[yellow]股票池來自目前資料快照；歷史回測可能有前視／存活者偏誤。[/yellow]",
+        )
+    else:
+        stock_ids = requested_stock_ids or ["2330"]
 
     end = end or datetime.now().strftime("%Y-%m-%d")
 
@@ -393,7 +473,13 @@ def backtest_run(
         import sqlite3
         conn = sqlite3.connect(DEFAULT_DB)
         try:
-            config_json = json.dumps({"stocks": stock_ids, "capital": capital, "signal": signal, "start": start, "end": end})
+            config_json = json.dumps({
+                "stocks": stock_ids, "requested_stocks": requested_stock_ids,
+                "capital": capital, "signal": signal, "start": start, "end": end,
+                "screen_id": screen_id,
+                "screen_criteria": criteria_data if screening_requested else None,
+                "screen_mode": "current_snapshot" if screening_requested else None,
+            })
             result_json = json.dumps({"total_return": m.total_return, "cagr": m.cagr, "volatility": m.volatility, "sharpe_ratio": m.sharpe_ratio, "max_drawdown": m.max_drawdown, "win_rate": m.win_rate, "total_trades": m.total_trades})
             cur = conn.execute(
                 "INSERT INTO backtest_results (name, config_json, result_json, metrics_json) VALUES (?, ?, ?, ?)",

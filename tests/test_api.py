@@ -3,6 +3,7 @@
 import os
 import shutil
 import tempfile
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -69,6 +70,26 @@ def test_institutional_endpoint():
     client = TestClient(create_app())
     resp = client.get("/stocks/2330/institutional")
     assert resp.status_code == 200
+
+
+def test_update_existing_endpoint():
+    client = TestClient(create_app())
+    with patch("subprocess.run") as run:
+        run.return_value.returncode = 0
+        run.return_value.stdout = "updated"
+        run.return_value.stderr = ""
+        resp = client.post(
+            "/stocks/update-existing",
+            params={"data_type": "institutional", "force": True, "start": "2024-01-01"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["scope"] == "existing"
+    run.assert_called_once()
+    command = run.call_args.args[0]
+    assert command[-7:] == [
+        "update", "existing", "--type", "institutional", "--force", "--start", "2024-01-01",
+    ]
 
 
 def test_screen_endpoint():
