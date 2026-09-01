@@ -560,6 +560,15 @@ tw-stock-analyzer backtest run --stocks 2330 --capital 1000000
 # Run with custom signal method and date range
 tw-stock-analyzer backtest run --stocks 2330,2454 --signal rsi --start 2024-01-01 --end 2024-12-31
 
+# Screen all cached stocks first, then backtest the matched universe
+tw-stock-analyzer backtest run --pe-max 20 --rsi-max 40 --start 2024-01-01
+
+# Restrict the candidate universe before screening
+tw-stock-analyzer backtest run --stocks 2330,2317,2454 --volume-spike 2 --spike-direction up
+
+# Apply criteria saved with `screen run --name ...`
+tw-stock-analyzer backtest run --screen-id 3 --start 2024-01-01
+
 # Save the result to the database
 tw-stock-analyzer backtest run --stocks 2330 --capital 500000 --save
 
@@ -577,12 +586,25 @@ Options for `backtest run`:
 
 | Option              | Description                                           |
 |---------------------|-------------------------------------------------------|
-| `--stocks, -s`      | Comma-separated stock IDs (required)                  |
+| `--stocks, -s`      | Optional comma-separated candidate universe; without screen criteria, defaults to `2330` |
 | `--capital, -c`     | Initial capital (default: 1,000,000)                  |
 | `--signal`          | Signal method: `ma_cross`, `rsi`, `macd` (default: `ma_cross`) |
 | `--start`           | Start date YYYY-MM-DD (default: `2024-01-01`)         |
 | `--end`             | End date YYYY-MM-DD (default: today)                  |
 | `--save`            | Save the result to the database for later review       |
+| `--screen-id`       | Apply a saved screen as the backtest universe filter   |
+
+`backtest run` also accepts every filtering option documented in the
+[`screen run` criteria table](#screen): PE, RSI, 20-day average volume,
+volume spike and direction, MA crossover and trend alignment, EPS, monthly
+revenue growth, and dividend yield. The flow is candidate universe → current
+screen → matched stocks → backtest.
+
+> **Backtest bias warning:** screening uses the current database snapshot.
+> The database does not preserve complete point-in-time publication
+> availability for historical fundamentals, so applying today's screen to a
+> historical period can introduce look-ahead and survivorship bias. CLI output
+> and REST responses identify this mode as `current_snapshot`.
 
 Available signal methods:
 
@@ -628,9 +650,13 @@ The API server exposes all analysis features as JSON endpoints:
 | GET    | `/stocks/{id}/fundamentals`       | Fundamental data               |
 | GET    | `/stocks/{id}/institutional`      | Institutional holdings         |
 | POST   | `/stocks/{id}/update`             | Trigger data fetch             |
+| POST   | `/stocks/update-existing`          | Update all stocks already in the database |
 | POST   | `/stocks/{id}/report`             | Generate analysis report       |
-| POST   | `/screen`                         | Run stock screening（含均線交叉）|
-| POST   | `/backtest`                       | Run portfolio backtest         |
+| POST   | `/screen`                         | Run or save stock screening criteria |
+| GET    | `/screens`                        | List saved screens             |
+| GET    | `/screens/{criteria_id}`          | Load and run a saved screen    |
+| DELETE | `/screens/{criteria_id}`          | Delete a saved screen          |
+| POST   | `/backtest`                       | Run a portfolio backtest, optionally with all screen filters |
 
 Example usage:
 
@@ -643,6 +669,11 @@ curl "http://localhost:8000/stocks/2330/analysis?indicators=ma,rsi,macd"
 
 # Screen stocks
 curl -X POST "http://localhost:8000/screen?pe_min=10&pe_max=20&rsi_max=30"
+
+# Run and save a screen, then list or execute saved criteria
+curl -X POST "http://localhost:8000/screen?pe_max=20&rsi_max=40&name=value-momentum"
+curl "http://localhost:8000/screens"
+curl "http://localhost:8000/screens/1"
 
 # 均線交叉：MA5 於最近 5 個交易日內上穿 MA10
 curl -X POST "http://localhost:8000/screen?ma_crossover=5x10&ma_within=5"
@@ -663,8 +694,14 @@ curl -X POST "http://localhost:8000/screen?volume_spike=2&volume_min=500000&spik
 `/screen` 在條件用到的欄位完全沒有資料時回傳 **409**（訊息會指出該跑哪個 `update`），而不是 200 加一份空清單——後者會被呼叫端讀成「沒有符合的股票」。
 
 ```bash
-# Run backtest
-curl -X POST "http://localhost:8000/backtest?stocks=2330,2454&capital=1000000&signal=ma_cross&start=2024-01-01&end=2024-12-31"
+# Incrementally update all stocks already present in the database
+curl -X POST "http://localhost:8000/stocks/update-existing?data_type=daily"
+
+# Run a screened backtest over all cached stocks
+curl -X POST "http://localhost:8000/backtest?pe_max=20&rsi_max=40&capital=1000000&signal=ma_cross&start_date=2024-01-01&end_date=2024-12-31"
+
+# Backtest a saved screen within an explicit candidate universe
+curl -X POST "http://localhost:8000/backtest?stocks=2330,2317,2454&screen_id=1&start_date=2024-01-01"
 ```
 
 ## Docker Multi-Service
