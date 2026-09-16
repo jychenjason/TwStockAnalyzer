@@ -24,8 +24,8 @@ venv/
 *.swp
 *.swo
 
-# Data
-data/
+# Data (repo-root only — must not swallow src/twstock_analyzer/data/)
+/data/
 
 # OMo
 .omo/evidence/

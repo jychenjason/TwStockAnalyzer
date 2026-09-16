@@ -20,6 +20,10 @@ from twstock_analyzer.data.sources.twse import TWSESource
 def _no_twse_http_wait(monkeypatch):
     """428 retry tests exercise delays without making the suite wait."""
     monkeypatch.setattr("twstock_analyzer.data.sources.twse.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "twstock_analyzer.data.sources.twse.time.monotonic",
+        lambda: 123456.0,
+    )
     monkeypatch.setattr("twstock_analyzer.data.sources.twse.random.uniform", lambda _a, _b: 0.0)
 
 
@@ -32,6 +36,16 @@ def _response(status: int, payload: dict | list) -> Mock:
     else:
         resp.raise_for_status.return_value = None
     return resp
+
+
+def _source_with(http_get) -> TWSESource:
+    """A TWSESource whose HTTP goes to a fake session (warm-up skipped)."""
+    source = TWSESource()
+    session = Mock()
+    session.get.side_effect = http_get
+    source._session = session
+    source._warmed_up = True
+    return source
 
 
 # 快照落後一天：要 08-20，只給得出 08-19。
@@ -55,15 +69,14 @@ STALE_SNAPSHOT = [
 class TestRateLimitedFetchIsNotSilentSuccess:
     def test_all_requests_rate_limited_raises_instead_of_empty(self):
         """STOCK_DAY 全部 428、快照又補不到區間——必須拋錯，不能回空表。"""
-        source = TWSESource()
-
         def fake_get(url, *args, **kwargs):
             if "STOCK_DAY_ALL" in url:
                 return _response(200, STALE_SNAPSHOT)
             return _response(428, {})
 
+        source = _source_with(fake_get)
+
         with (
-            patch("twstock_analyzer.data.sources.twse.requests.get", side_effect=fake_get),
             patch("twstock_analyzer.data.loader.time.sleep"),
             pytest.raises(Exception) as excinfo,
         ):
@@ -72,8 +85,7 @@ class TestRateLimitedFetchIsNotSilentSuccess:
         assert "428" in str(excinfo.value)
 
     def test_transient_failure_is_retried_not_reported_as_fetch_error(self):
-        """限流是暫時性的——必須讓 retry 裝飾器有機會退避重試。"""
-        source = TWSESource()
+        """限流是暫時性的——必須讓 retry 有機會退避重試。"""
         attempts = {"n": 0}
 
         ok_payload = {
@@ -91,10 +103,9 @@ class TestRateLimitedFetchIsNotSilentSuccess:
                 return _response(428, {})
             return _response(200, ok_payload)
 
-        with (
-            patch("twstock_analyzer.data.sources.twse.requests.get", side_effect=fake_get),
-            patch("twstock_analyzer.data.loader.time.sleep"),
-        ):
+        source = _source_with(fake_get)
+
+        with patch("twstock_analyzer.data.loader.time.sleep"):
             result = source.fetch_daily("2348", "2026-08-20", "2026-08-20")
 
         assert not result.empty
@@ -103,15 +114,14 @@ class TestRateLimitedFetchIsNotSilentSuccess:
 
     def test_genuinely_no_data_still_returns_empty(self):
         """真的沒資料（stat 不是 OK，沒有任何請求失敗）維持空表，不是錯誤。"""
-        source = TWSESource()
-
         def fake_get(url, *args, **kwargs):
             if "STOCK_DAY_ALL" in url:
                 return _response(200, [])
             return _response(200, {"stat": "很抱歉，沒有符合條件的資料!"})
 
-        with patch("twstock_analyzer.data.sources.twse.requests.get", side_effect=fake_get):
-            result = source.fetch_daily("2348", "2026-08-20", "2026-08-20")
+        source = _source_with(fake_get)
+
+        result = source.fetch_daily("2348", "2026-08-20", "2026-08-20")
 
         assert result.empty
 
@@ -133,28 +143,29 @@ class TestRetryBackoff:
 
 class TestTwseHttpRecovery:
     def test_428_uses_targeted_exponential_backoff_then_recovers(self):
-        source = TWSESource()
         responses = [
             _response(428, {}),
             _response(428, {}),
             _response(200, {"stat": "OK"}),
         ]
+
         for response in responses:
             response.headers = {}
             response.text = ""
             response.url = "https://www.twse.com.tw/test"
 
+        source = _source_with(responses)
+
         with (
-            patch("twstock_analyzer.data.sources.twse.requests.get", side_effect=responses),
             patch("twstock_analyzer.data.sources.twse.time.sleep") as sleep,
         ):
             result = source._get("https://www.twse.com.tw/test", timeout=30)
 
         assert result.status_code == 200
-        assert [call.args[0] for call in sleep.call_args_list] == [2.0, 4.0]
+        # cooldown 5 → 10 秒（COOLDOWN_STEP 加倍）；蓋過短的指數退避 2s/4s
+        assert [call.args[0] for call in sleep.call_args_list] == [5.0, 10.0]
 
     def test_retry_after_takes_precedence_over_backoff(self):
-        source = TWSESource()
         limited = _response(428, {})
         limited.headers = {"Retry-After": "7"}
         limited.text = "precondition or edge-policy response"
@@ -163,14 +174,83 @@ class TestTwseHttpRecovery:
         ok.headers = {}
         ok.text = ""
         ok.url = limited.url
+        source = _source_with([limited, ok])
 
-        with (
-            patch("twstock_analyzer.data.sources.twse.requests.get", side_effect=[limited, ok]),
-            patch("twstock_analyzer.data.sources.twse.time.sleep") as sleep,
-        ):
+        with patch("twstock_analyzer.data.sources.twse.time.sleep") as sleep:
             source._get(limited.url)
 
         sleep.assert_called_once_with(7.0)
+
+
+class TestRateLimitPacing:
+    """新的 428 修法契約：瀏覽器樣請求外觀、請求間距、跨請求冷卻與風暴長退避。"""
+
+    def test_real_session_sends_browser_like_headers(self):
+        source = TWSESource()
+        assert "Mozilla" in source._session.headers["User-Agent"]
+        assert source._session.headers.get("Referer") == "https://www.twse.com.tw/"
+        assert "Accept-Language" in source._session.headers
+
+    def test_warmup_runs_once_with_the_warmup_url(self):
+        source = TWSESource()
+        session = Mock()
+        session.get.return_value = _response(200, {})
+        source._session = session
+
+        source._maybe_warmup()
+        source._maybe_warmup()
+
+        session.get.assert_called_once_with(source.WARMUP_URL, timeout=10)
+
+    def test_successful_requests_are_spaced_by_min_interval(self):
+        source = _source_with(lambda *a, **k: _response(200, {}))
+
+        with patch("twstock_analyzer.data.sources.twse.time.sleep") as sleep:
+            source._get("https://www.twse.com.tw/1", timeout=30)
+            source._get("https://www.twse.com.tw/2", timeout=30)
+
+        assert [call.args[0] for call in sleep.call_args_list] == [0.5]
+
+    def test_cooldown_carries_to_the_next_request(self):
+        responses = [
+            _response(428, {}),
+            _response(428, {}),
+            _response(200, {"stat": "OK"}),
+            _response(200, {}),
+        ]
+        for r in responses:
+            r.headers = {}
+            r.text = ""
+            r.url = "https://www.twse.com.tw/test"
+        source = _source_with(responses)
+
+        # 前兩次 428 把冷卻推到 5→10 秒；成功只重置連續計數，冷卻本身要沿用
+        # 到「下一檔股票」——這就是批次不再續命限流窗的關鍵。
+        with patch("twstock_analyzer.data.sources.twse.time.sleep") as sleep:
+            source._get("https://www.twse.com.tw/test", timeout=30)
+            source._get("https://www.twse.com.tw/test", timeout=30)
+
+        assert [call.args[0] for call in sleep.call_args_list] == [5.0, 10.0, 10.0]
+
+    def test_storm_escalates_to_long_backoff_after_three_hits(self):
+        responses = [
+            _response(428, {}),
+            _response(428, {}),
+            _response(428, {}),
+            _response(200, {"stat": "OK"}),
+        ]
+        for r in responses:
+            r.headers = {}
+            r.text = ""
+            r.url = "https://www.twse.com.tw/test"
+        source = _source_with(responses)
+
+        with patch("twstock_analyzer.data.sources.twse.time.sleep") as sleep:
+            result = source._get("https://www.twse.com.tw/test", timeout=30)
+
+        assert result.status_code == 200
+        # 一般退避 5→10 之後，第三次起改用長退避（30 秒），不再短連發。
+        assert [call.args[0] for call in sleep.call_args_list] == [5.0, 10.0, 30.0]
 
 
 class TestBatchSummaryNamesFailures:
@@ -226,10 +306,9 @@ class TestInstitutionalRateLimitIsNotAHoliday:
     """
 
     def test_every_request_rate_limited_raises_instead_of_empty(self):
-        source = TWSESource()
+        source = _source_with(lambda *a, **k: _response(428, {}))
 
         with (
-            patch("twstock_analyzer.data.sources.twse.requests.get", return_value=_response(428, {})),
             patch("time.sleep"),
             pytest.raises(Exception) as excinfo,
         ):
@@ -239,12 +318,9 @@ class TestInstitutionalRateLimitIsNotAHoliday:
 
     def test_a_genuine_holiday_still_returns_an_empty_frame(self):
         """TWSE 對非交易日回 200 但沒有 data 欄位——那是答案，不該拋錯。"""
-        source = TWSESource()
+        source = _source_with(lambda *a, **k: _response(200, {"stat": "OK"}))
 
-        with (
-            patch("twstock_analyzer.data.sources.twse.requests.get", return_value=_response(200, {"stat": "OK"})),
-            patch("time.sleep"),
-        ):
+        with patch("time.sleep"):
             frame = source.fetch_institutional("2330", "2026-08-20", "2026-08-20")
 
         assert frame.empty

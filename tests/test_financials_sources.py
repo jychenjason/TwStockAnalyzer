@@ -11,6 +11,8 @@ OpenAPI：
 且含全形括號，抄錯一個字就整欄變 None 而不會報錯。
 """
 
+from unittest.mock import Mock
+
 import pandas as pd
 import pytest
 
@@ -138,7 +140,10 @@ class TestFetchers:
             called["url"] = url
             return _FakeResponse(QUARTERLY_SAMPLE)
 
-        monkeypatch.setattr("twstock_analyzer.data.sources.twse.requests.get", fake_get)
+        fake_session = Mock()
+        fake_session.get.side_effect = fake_get
+        source._session = fake_session
+        source._warmed_up = True
         frame = source.fetch_quarterly_financials()
 
         assert "t187ap14_L" in called["url"]
@@ -151,7 +156,10 @@ class TestFetchers:
             called["url"] = url
             return _FakeResponse(MONTHLY_SAMPLE)
 
-        monkeypatch.setattr("twstock_analyzer.data.sources.twse.requests.get", fake_get)
+        fake_session = Mock()
+        fake_session.get.side_effect = fake_get
+        source._session = fake_session
+        source._warmed_up = True
         frame = source.fetch_monthly_revenue()
 
         assert "t187ap05_L" in called["url"]
