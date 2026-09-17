@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,49 @@ if TYPE_CHECKING:
     from twstock_analyzer.utils.logger import get_logger  # noqa: F401
 
 load_dotenv()
+
+
+class _LoguruInterceptHandler(logging.Handler):
+    """Forward loguru records into the stdlib logging system.
+
+    FinMind reconfigures loguru at import time with its own stderr sink, whose
+    default output (``2026-09-16 23:15:18.630 | INFO | module:func:line - msg``)
+    does not match the project's ``LOG_FORMAT``.  loguru's standard
+    ``StandardSink`` already hands us a :class:`logging.LogRecord`, so we only
+    re-dispatch it to the logger named after FinMind; the project's formatter
+    then renders it like every other line.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        target = logging.getLogger(record.name or "FinMind")
+        target.handle(record)
+
+
+_LOGURU_REDIRECTED = False
+
+
+def _redirect_loguru_to_stdlib() -> None:
+    """Replace FinMind's loguru stderr sink with a stdlib-forwarding one.
+
+    Runs once, just after ``FinMind`` is first imported (its import-time
+    ``logger.remove()`` would otherwise wipe any earlier setup).  The
+    ``FinMind`` logger namespace gets the project's console/file handlers so
+    FinMind messages surface with the standard format.
+    """
+    global _LOGURU_REDIRECTED
+    if _LOGURU_REDIRECTED:
+        return
+    from loguru import logger as loguru_logger
+
+    loguru_logger.remove()
+    loguru_logger.add(
+        _LoguruInterceptHandler(), level="INFO", format="{message}"
+    )
+
+    from twstock_analyzer.utils.logger import get_logger
+
+    get_logger("FinMind")
+    _LOGURU_REDIRECTED = True
 
 
 class FinMindSource(BaseDataSource):
@@ -38,6 +82,7 @@ class FinMindSource(BaseDataSource):
     def _get_dl(self):
         if self._dl is None:
             from FinMind.data import DataLoader
+            _redirect_loguru_to_stdlib()
             self._dl = DataLoader()
         return self._dl
 

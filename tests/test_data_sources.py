@@ -1,18 +1,19 @@
 """Tests for data source modules."""
 
-import pandas as pd
-import pytest
+import logging
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+import pytest
+
 from twstock_analyzer.data.loader import (
-    BaseDataSource,
-    DataFetchError,
-    DataFallbackError,
-    DataLoader,
     RETRY_MAX_ATTEMPTS,
-    RETRY_BASE_DELAY,
-    validate_stock_id,
+    BaseDataSource,
+    DataFallbackError,
+    DataFetchError,
+    DataLoader,
     validate_date,
+    validate_stock_id,
 )
 from twstock_analyzer.data.sources.finmind import FinMindSource
 from twstock_analyzer.data.sources.twse import TWSESource
@@ -149,6 +150,35 @@ class TestFinMindSource:
         assert "close" in result.columns
         assert "volume" in result.columns
         assert "turnover" in result.columns
+
+    def test_loguru_is_redirected_into_stdlib_format(self, capsys):
+        import re
+
+        from loguru import logger as loguru_logger
+
+        from twstock_analyzer.data.sources import finmind as finmind_mod
+
+        finmind_mod._LOGURU_REDIRECTED = False
+        fm_logger = logging.getLogger("FinMind")
+        for h in list(fm_logger.handlers):
+            fm_logger.removeHandler(h)
+        finmind_mod._redirect_loguru_to_stdlib()
+
+        loguru_logger.patch(
+            lambda r: r.update(
+                name="FinMind.data.finmind_api",
+                function="login_by_token",
+                line=85,
+            )
+        ).info("Login success")
+
+        out = capsys.readouterr().err
+        assert re.match(
+            r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} \| INFO\s+\| FinMind\.data\.finmind_api \|",
+            out,
+        ), out
+        assert "Login success" in out
+        assert "login_by_token" not in out
 
 
 class TestTWSESource:

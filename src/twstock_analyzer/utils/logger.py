@@ -74,6 +74,9 @@ def _build_metrics_string(record: logging.LogRecord) -> str:
         'exc_text', 'stack_info', 'context', 'status', 'metrics',
         'getMessage', 'thread', 'threadName', 'processName',
         'process', 'taskName', 'asctime', CONSOLE_ECHOED_ATTR,
+        # loguru > logging forwarding (see FinMind source) stashes the
+        # original loguru extras under this key; it is bookkeeping only.
+        'extra',
     ))
     parts = []
     for k, v in record.__dict__.items():
